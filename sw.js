@@ -8,7 +8,7 @@
 // correrlo antes de publicar (si no, los usuarios siguen con la versión vieja).
 
 // <precache> (generado: no editar a mano)
-const VERSION = '129d209a7a5a';
+const VERSION = 'd966fab60408';
 const ARCHIVOS = [
   "./",
   "css/app.css",

@@ -5,7 +5,8 @@
 // Las funciones `anclas*` miden la foto (puntos de referencia en un sistema de ejes alineado con el
 // marco) y las usa también la calibración, para que la app y la calibración midan igual.
 import { TIPOS, proporcionDe } from './tipos.js';
-import { aCoordenadasMarco, desdeCoordenadasMarco, encajarEnImagen } from './geometria.js';
+import { aCoordenadasMarco, desdeCoordenadasMarco, encajarEnImagen, cajaAVista, desdeVistaNorm, normalizarAngulo } from './geometria.js';
+import { giroDeFoto } from './clasificar.js';
 import { CONSTANTES } from './constantes.js';
 
 const LIMITE_NIVEL = 10; // grados; más que esto no es un error de nivel sino una foto girada
@@ -99,39 +100,65 @@ function recortePerfil(a, tipo, C) {
 // ---------------------------------------------------------------------------------------------
 // Intraorales (caja de dientes/encías)
 
-// Caja de la fuente indicada ('boca', 'dientes' o 'arco'), normalizada, o null.
-export function cajaIntraoral(a, fuente) {
-  return a.dientes?.[fuente] || null;
+// Giro k (0..3) con el que se ve derecha una intraoral: el que dejó la clasificación de la sesión
+// (`a.giro`, común a las tomas repetidas) o, si no hay, el de la foto sola.
+export function giroIntraoral(a, C = CONSTANTES) {
+  if (Number.isInteger(a?.giro)) return a.giro & 3;
+  return a?.dientes?.mapa ? giroDeFoto(a, C) : 0;
 }
 
-// Tamaño de la caja expresado como ancho de un marco de proporción `prop` (fracción del ancho de
-// la foto): 'ancho' usa solo el ancho de la caja; 'max', el mayor entre el ancho y el alto pasado a
-// ancho; 'media', el promedio de los dos.
-export function medidaCaja(a, caja, medida = 'ancho', prop = 4 / 3) {
+// Medidas de la "vista k" (la foto girada 90·k): ancho y alto en píxeles.
+export function medidasVista(a, k) {
+  return k % 2 ? { ancho: a.alto, alto: a.ancho } : { ancho: a.ancho, alto: a.alto };
+}
+
+// Caja de la fuente indicada ('boca', 'dientes', 'sueltos' o 'arco'), normalizada en la vista k, o null.
+export function cajaIntraoral(a, fuente, k = 0) {
+  const c = a.dientes?.[fuente];
+  return c ? cajaAVista(c, k) : null;
+}
+
+// Tamaño de la caja (en la vista k) expresado como ancho de un marco de proporción `prop`
+// (fracción del ancho de la vista): 'ancho' usa solo el ancho de la caja; 'max', el mayor entre el
+// ancho y el alto pasado a ancho; 'media', el promedio de los dos.
+export function medidaCaja(a, caja, medida = 'ancho', prop = 4 / 3, k = 0) {
+  const v = medidasVista(a, k);
   const w = caja.x1 - caja.x0;
-  const hw = (caja.y1 - caja.y0) * (a.alto / a.ancho) * prop;
+  const hw = (caja.y1 - caja.y0) * (v.alto / v.ancho) * prop;
   if (medida === 'max') return Math.max(w, hw);
   if (medida === 'media') return (w + hw) / 2;
   return w;
 }
 
+// Pasa un marco calculado en la vista k (centro normalizado de la vista, ancho como fracción del
+// ancho de la vista) a un Recorte de la foto, con ángulo 90·k.
+function marcoDesdeVista(a, k, cx, cy, w, prop) {
+  const v = medidasVista(a, k);
+  const [x, y] = desdeVistaNorm(cx, cy, k);
+  const ancho = w * v.ancho;
+  return { cx: x * a.ancho, cy: y * a.alto, ancho, alto: ancho / prop, angulo: normalizarAngulo(90 * k) };
+}
+
+// Las constantes (centro, desplazamientos, tamaño) se miden en la vista derecha, así sirven igual
+// para una foto que hubo que girar.
 function recorteIntraoral(a, tipo, C) {
   const k = C.intraoral[tipo];
-  const W = a.ancho, H = a.alto;
+  const giro = giroIntraoral(a, C);
   const prop = proporcionDe(tipo);
   let cx = k.previo.cx, cy = k.previo.cy, w = k.previo.ancho, confianza = 0.3, fuente = 'previo';
-  const caja = k.fuente !== 'previo' ? cajaIntraoral(a, k.fuente) : null;
+  const caja = k.fuente !== 'previo' ? cajaIntraoral(a, k.fuente, giro) : null;
   if (caja) {
     const dcx = (caja.x0 + caja.x1) / 2 + k.dx, dcy = (caja.y0 + caja.y1) / 2 + k.dy;
-    const dw = medidaCaja(a, caja, k.medida, prop) * k.anchoPorCaja;
+    const dw = medidaCaja(a, caja, k.medida, prop, giro) * k.anchoPorCaja;
     cx = k.peso * dcx + (1 - k.peso) * cx;
     cy = k.peso * dcy + (1 - k.peso) * cy;
     w = k.pesoTam * dw + (1 - k.pesoTam) * w;
     confianza = 0.6;
     fuente = k.fuente;
   }
-  const ancho = w * W;
-  return { recorte: { cx: cx * W, cy: cy * H, ancho, alto: ancho / prop, angulo: 0 }, confianza, fuente };
+  // Una lateral sin certeza sobre el espejo puede quedar con el volteo equivocado.
+  if ((tipo === 'io_lateral_1' || tipo === 'io_lateral_2') && a.espejo == null) confianza *= 0.7;
+  return { recorte: marcoDesdeVista(a, giro, cx, cy, w, prop), confianza, fuente };
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -140,12 +167,10 @@ function recorteIntraoral(a, tipo, C) {
 // especificación: usar las fracciones solo cuando no hay detección).
 function recorteRespaldo(a, tipo, C) {
   const prop = proporcionDe(tipo);
-  const W = a.ancho, H = a.alto;
   const fam = familiaDe(tipo);
-  let ancho;
-  if (fam === 'intraoral') ancho = C.respaldo.anchoIntraoral * W;
-  else ancho = C.respaldo.altoRetrato * H * prop;
-  return { recorte: { cx: W / 2, cy: H / 2, ancho, alto: ancho / prop, angulo: 0 }, confianza: 0.1, fuente: 'respaldo' };
+  if (fam === 'intraoral') return { recorte: marcoDesdeVista(a, giroIntraoral(a, C), 0.5, 0.5, C.respaldo.anchoIntraoral, prop), confianza: 0.1, fuente: 'respaldo' };
+  const ancho = C.respaldo.altoRetrato * a.alto * prop;
+  return { recorte: { cx: a.ancho / 2, cy: a.alto / 2, ancho, alto: ancho / prop, angulo: 0 }, confianza: 0.1, fuente: 'respaldo' };
 }
 
 // Recorte automático de la foto `a` (su análisis) para el tipo `tipo`.

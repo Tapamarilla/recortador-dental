@@ -7,7 +7,7 @@
 
 import { volteoDe } from './tipos.js';
 
-export const VERSION_APP = '1.0.0';
+export const VERSION_APP = '1.1.0';
 export const VERSION_FORMATO = 1;
 
 const redondear = (n, decimales) => (Number.isFinite(n) ? Number(n.toFixed(decimales)) : null);

@@ -4,11 +4,20 @@
 //   recorteAutomatico(foto, tipo) → Promise<{ recorte, angulo, confianza }>
 //   cargarImagenCompleta(foto) → Promise<ImageBitmap>
 //
+// Agregados al contrato (sin cambiarlo):
+//   foto.volteoAuto   volteo propuesto para la foto según su tipo ACTUAL: las laterales tomadas sin
+//                     espejo (foto.analisis.espejo === false) no se voltean; el resto, volteoDe(tipo).
+//                     La interfaz usa espacio.volteo ?? foto.volteoAuto ?? volteoDe(tipo).
+//   foto.analisis.giro    k (0..3): las intraorales cuyo contenido viene girado (celular apuntando
+//                         hacia abajo o hacia arriba) se recortan con Recorte.angulo = 90·k.
+//   foto.analisis.espejo  true / false / null (no se sabe) para las tomas con espejo.
+//   reclasificar() vuelve a calcular giro, espejo y volteoAuto de todas las fotos.
+//
 // El análisis de cada foto corre en un Worker de módulo (js/worker/analisis.worker.js). Si el
 // Worker no se puede crear o falla, se analiza en el hilo principal, cediendo el control entre foto
 // y foto para que la interfaz siga pintando (el progreso se ve igual).
 import { analizarArchivo } from './analisis.js';
-import { clasificarSesion, agrupar, armarEspacios, tipoDeCarpeta } from './clasificar.js';
+import { clasificarSesion, agrupar, armarEspacios, tipoDeCarpeta, orientarSesion } from './clasificar.js';
 import { recortePara } from './recorte.js';
 import { decodificarCompleta } from './imagen.js';
 
@@ -152,6 +161,8 @@ function calcularEspacios(fotos, espaciosPrevios = []) {
 // Tras cambios de tipo hechos por el usuario: rehace los grupos y los espacios. Si se pasan los
 // espacios anteriores, conserva las elegidas que sigan siendo candidatas y los recortes editados.
 export function reclasificar(fotos, espaciosPrevios = []) {
+  // El giro, el espejo y el volteo propuesto dependen del tipo actual de cada foto.
+  orientarSesion(fotos);
   agrupar(fotos);
   return calcularEspacios(fotos, espaciosPrevios);
 }

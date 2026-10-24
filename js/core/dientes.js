@@ -175,7 +175,27 @@ export function manchasSueltas(m, w, h) {
   return sueltas;
 }
 
-// Rasgos intraorales de una foto: cajas candidatas para el recorte y rasgos de la vista.
+// Gira un canal (un valor por píxel) o una imagen RGBA (`canales` = 4) igual que rotarImagen de
+// geometria.js: lo que se ve con un marco de ángulo 90·k que cubre toda la foto.
+function rotarArreglo(arr, W, H, k, canales = 1) {
+  k &= 3;
+  if (!k) return arr;
+  const w = k === 2 ? W : H, h = k === 2 ? H : W;
+  const out = new arr.constructor(w * h * canales);
+  for (let v = 0; v < h; v++) {
+    for (let u = 0; u < w; u++) {
+      let x, y;
+      if (k === 1) { x = W - 1 - v; y = u; } else if (k === 2) { x = W - 1 - u; y = H - 1 - v; } else { x = v; y = H - 1 - u; }
+      const i = (y * W + x) * canales, j = (v * w + u) * canales;
+      for (let c = 0; c < canales; c++) out[j + c] = arr[i + c];
+    }
+  }
+  return out;
+}
+
+// Rasgos intraorales de una foto: cajas candidatas para el recorte (en la foto sin girar), rasgos
+// de la vista para cada giro k·90° (vistas[k]: como se vería con un marco de ángulo 90·k) y rasgos
+// que distinguen una foto tomada con espejo de una directa.
 //   dientes: caja de los dientes limpios.
 //   sueltos: caja de las manchas de diente sueltas.
 //   arco: caja de la arcada principal (sin la arcada opuesta ni los dientes fuera del espejo).
@@ -192,18 +212,92 @@ export function rasgosDientes(img) {
     if (limpio[k]) nd++;
     if (limpio[k] || m[k] === MUCOSA) boca[k] = 1;
   }
+  const vistas = [0, 1, 2, 3].map((k) => rasgosVista(
+    { data: rotarArreglo(img.data, w, h, k, 4), width: k % 2 ? h : w, height: k % 2 ? w : h },
+    rotarArreglo(m, w, h, k), rotarArreglo(sueltas, w, h, k),
+  ));
   return {
     frac: r4(nd / n),
     dientes: cajaPercentil(limpio, w, h, 0.05),
     sueltos: cajaPercentil(sueltas, w, h, 0.05),
     arco: cajaPercentil(arcadaPrincipal(limpio, w, h), w, h, 0.02),
     boca: cajaPercentil(boca, w, h, 0.05),
-    vista: rasgosVista(img, m, sueltas),
+    vista: vistas[0],
+    vistas,
+    espejo: rasgosEspejo(img, m),
+    mapa: mapaClases(img, m),
   };
 }
 
-// Rasgos para reconocer la vista intraoral (frontal, lateral, oclusal) sin depender del orden.
-export function rasgosVista(img, m, limpio) {
+// Mapa de distribución: la foto dividida en MAPA_LADO × MAPA_LADO celdas (en coordenadas
+// normalizadas) y, en cada una, la fracción de píxeles de cada clase: diente, mucosa, oscuro,
+// plástico claro, otro. Lo usa el modelo de orientación (clasificar.js).
+export const MAPA_LADO = 6, MAPA_CLASES = 5;
+export function mapaClases(img, m) {
+  const { data, width: w, height: h } = img;
+  const G = MAPA_LADO, Q = MAPA_CLASES;
+  const f = new Float64Array(G * G * Q), cuenta = new Float64Array(G * G);
+  for (let y = 0; y < h; y++) {
+    const fila = Math.floor(y * G / h) * G;
+    for (let x = 0; x < w; x++) {
+      const j = y * w + x, i = j * 4;
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const max = Math.max(r, g, b), min = Math.min(r, g, b), sat = max ? (max - min) / max : 0;
+      const c = max < 50 ? 2 : m[j] === DIENTE ? 0 : m[j] === MUCOSA ? 1 : sat < 0.15 && max > 140 ? 3 : 4;
+      const cel = fila + Math.floor(x * G / w);
+      cuenta[cel]++; f[cel * Q + c]++;
+    }
+  }
+  const out = [];
+  for (let k = 0; k < G * G; k++) for (let q = 0; q < Q; q++) out.push(r4(f[k * Q + q] / Math.max(1, cuenta[k])));
+  return out;
+}
+
+// El mapa visto con un giro k (las celdas de una grilla normalizada se permutan al girar 90°).
+export function mapaGirado(mapa, k) {
+  k &= 3;
+  if (!k) return mapa;
+  const G = MAPA_LADO, Q = MAPA_CLASES;
+  const out = new Array(mapa.length);
+  for (let v = 0; v < G; v++) {
+    for (let u = 0; u < G; u++) {
+      // Celda (u, v) de la vista k ← celda de la foto que cae en el mismo lugar.
+      let x, y;
+      if (k === 1) { x = G - 1 - v; y = u; } else if (k === 2) { x = G - 1 - u; y = G - 1 - v; } else { x = v; y = G - 1 - u; }
+      for (let q = 0; q < Q; q++) out[(v * G + u) * Q + q] = mapa[(y * G + x) * Q + q];
+    }
+  }
+  return out;
+}
+
+// Rasgos que no dependen del giro y ayudan a saber si una lateral se tomó con espejo:
+// piel de la cara (labios y nariz se ven en las tomas directas), plástico claro de los retractores,
+// zonas oscuras (fuera del espejo) y dientes que tocan los bordes de los lados.
+export function rasgosEspejo(img, m) {
+  const { data, width: w, height: h } = img;
+  const n = w * h;
+  let piel = 0, plastico = 0, oscuro = 0, mucosa = 0;
+  for (let i = 0, j = 0; j < n; i += 4, j++) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const max = Math.max(r, g, b), min = Math.min(r, g, b);
+    const sat = max ? (max - min) / max : 0;
+    if (max < 50) { oscuro++; continue; }
+    if (m[j] === MUCOSA) mucosa++;
+    // Tono de piel: anaranjado (verde bastante por encima del azul), saturación media.
+    if (m[j] !== DIENTE && r >= g && g > b * 1.08 && sat > 0.15 && sat < 0.6 && g > 0.62 * r) piel++;
+    if (sat < 0.15 && max > 140) plastico++;
+  }
+  const { etiqueta, comps } = componentes(m, w, h, DIENTE);
+  let lados = 0;
+  for (let k = 0; k < n; k++) {
+    const c = comps[etiqueta[k]];
+    if (c && c.borde && c.n < 0.06 * n && (c.x0 === 0 || c.x1 === w - 1)) lados++;
+  }
+  return { piel: r4(piel / n), plastico: r4(plastico / n), oscuro: r4(oscuro / n), mucosa: r4(mucosa / n), dientesLados: r4(lados / n) };
+}
+
+// Rasgos para reconocer la vista intraoral (frontal, lateral, oclusal) y su orientación.
+export function rasgosVista(img, m, sueltas) {
   const { data, width: w, height: h } = img;
   const n = w * h;
   // Dientes que tocan el borde izquierdo o derecho (dientes reales fuera del espejo en laterales)
@@ -217,24 +311,55 @@ export function rasgosVista(img, m, limpio) {
     if (c.x1 === w - 1) bordeDer++;
     if (c.y1 === h - 1) bordeAbajo++;
   }
+  // "Imagen doble" de las tomas con espejo: dientes reales (de cerca, altos) fuera del espejo, en
+  // una franja angosta junto al borde izquierdo o derecho. Alto de la más alta (fracción del alto).
+  let alturaBorde = 0;
+  for (const c of comps) {
+    if (!c || c.n > 0.08 * n) continue;
+    if ((c.x0 === 0 && c.x1 < w * 0.35) || (c.x1 === w - 1 && c.x0 > w * 0.65)) alturaBorde = Math.max(alturaBorde, (c.y1 - c.y0 + 1) / h);
+  }
+  // Plástico claro (retractores): centro horizontal. En una lateral directa, el retractor separa
+  // la mejilla del lado de los molares, opuesto a los incisivos.
+  let px = 0, pn = 0;
+  for (let y = 0, i = 0; y < h; y++) {
+    for (let x = 0; x < w; x++, i += 4) {
+      const r = data[i], g = data[i + 1], b = data[i + 2];
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      if (max > 140 && (max - min) / max < 0.15) { px += x / w; pn++; }
+    }
+  }
   const hx = new Float64Array(w), hy = new Float64Array(h);
   let t = 0, centro = 0;
   for (let y = 0; y < h; y++) {
     for (let x = 0; x < w; x++) {
-      if (!limpio[y * w + x]) continue;
+      if (!sueltas[y * w + x]) continue;
       hx[x]++; hy[y]++; t++;
       // Zona central de la mitad de abajo: vacía en las oclusales (paladar o lengua).
       if (y > h * 0.45 && x > w * 0.35 && x < w * 0.65) centro++;
     }
   }
   const pc = (hist, q) => { let a = 0; for (let i = 0; i < hist.length; i++) { a += hist[i]; if (a >= t * q) return i / hist.length; } return 1; };
-  // Centro horizontal de los dientes pesando cada mancha por su área al cuadrado: domina la zona
-  // de los dientes grandes (incisivos y canino). En la lateral 1 quedan a la izquierda del espejo;
-  // en la lateral 2, a la derecha.
-  let g1 = 0, g0 = 0;
-  for (const c of componentes(limpio, w, h, 1).comps) {
+  const x10 = pc(hx, 0.1), x90 = pc(hx, 0.9), y10 = pc(hy, 0.1), y90 = pc(hy, 0.9);
+  // Reparto arriba/abajo dentro de la zona de los dientes: los incisivos superiores son más grandes
+  // (frontal y laterales) y en las oclusales el frente del arco (incisivos) es el lado cerrado de la U.
+  const ym = (y10 + y90) / 2;
+  const cx0 = x10 + (x90 - x10) / 3, cx1 = x90 - (x90 - x10) / 3;
+  let arriba = 0, cArr = 0, cAba = 0;
+  for (let y = 0; y < h; y++) {
+    const yn = y / h;
+    for (let x = 0; x < w; x++) {
+      if (!sueltas[y * w + x]) continue;
+      if (yn < ym) arriba++;
+      const xn = x / w;
+      if (xn >= cx0 && xn <= cx1) { if (yn < ym) cArr++; else cAba++; }
+    }
+  }
+  // Centro de los dientes grandes (manchas pesadas por su área al cuadrado): incisivos y canino.
+  let g1 = 0, gy = 0, g0 = 0;
+  for (const c of componentes(sueltas, w, h, 1).comps) {
     if (!c) continue;
-    g1 += ((c.x0 + c.x1 + 1) / 2 / w) * c.n * c.n; g0 += c.n * c.n;
+    const p = c.n * c.n;
+    g1 += ((c.x0 + c.x1 + 1) / 2 / w) * p; gy += ((c.y0 + c.y1 + 1) / 2 / h) * p; g0 += p;
   }
   // Asimetría izquierda-derecha del color (frontal y oclusales son casi simétricas).
   let asim = 0;
@@ -242,6 +367,17 @@ export function rasgosVista(img, m, limpio) {
     for (let x = 0; x < w >> 1; x++) {
       const i = (y * w + x) * 4, j = (y * w + (w - 1 - x)) * 4;
       asim += Math.abs(data[i] - data[j]) + Math.abs(data[i + 1] - data[j + 1]) + Math.abs(data[i + 2] - data[j + 2]);
+    }
+  }
+  // Zona central (dentro del arco en las oclusales): brillo y textura. El paladar es más claro y liso
+  // que la lengua; sirve comparado con las otras fotos de la misma sesión.
+  let lumC = 0, texC = 0, nC = 0;
+  const lum = (i) => 0.3 * data[i] + 0.59 * data[i + 1] + 0.11 * data[i + 2];
+  for (let y = Math.max(1, Math.floor(h * 0.35)); y < Math.min(h - 1, h * 0.75); y++) {
+    for (let x = Math.max(1, Math.floor(w * 0.35)); x < Math.min(w - 1, w * 0.65); x++) {
+      const i = (y * w + x) * 4;
+      const l = 4 * lum(i) - lum(i - 4) - lum(i + 4) - lum(i - w * 4) - lum(i + w * 4);
+      lumC += lum(i); texC += l * l; nC++;
     }
   }
   // Oscuridad en la franja de arriba (nariz/sombra en la oclusal superior) y en las esquinas.
@@ -254,16 +390,28 @@ export function rasgosVista(img, m, limpio) {
       if ((x < w * 0.15 || x >= w * 0.85) && (y < h * 0.2 || y >= h * 0.8)) { nEsq++; if (v < 60) oscEsq++; }
     }
   }
+  const cxGrandes = g0 ? g1 / g0 : 0.5;
   return {
     dientes: r4(t / n),
-    altoDientes: t ? r4(pc(hy, 0.9) - pc(hy, 0.1)) : 0,
-    anchoDientes: t ? r4(pc(hx, 0.9) - pc(hx, 0.1)) : 0,
+    altoDientes: t ? r4(y90 - y10) : 0,
+    anchoDientes: t ? r4(x90 - x10) : 0,
+    // log(alto/ancho) de la zona de dientes en píxeles: banda horizontal < 0, vertical > 0.
+    aspecto: t ? r4(Math.log(Math.max(1, (y90 - y10) * h) / Math.max(1, (x90 - x10) * w))) : 0,
     cyDientes: t ? r4(pc(hy, 0.5)) : 0.5,
     cxDientes: t ? r4(pc(hx, 0.5)) : 0.5,
-    cxGrandes: g0 ? r4(g1 / g0) : 0.5,
+    cxGrandes: r4(cxGrandes),
+    ladoGrandes: r4(Math.abs(cxGrandes - 0.5)),
+    cyGrandes: g0 && y90 > y10 ? r4((gy / g0 - y10) / (y90 - y10)) : 0.5,
+    masaArriba: t ? r4(arriba / t) : 0.5,
+    centroArriba: cArr + cAba ? r4((cArr - cAba) / (cArr + cAba)) : 0,
     centroVacio: t ? r4(1 - centro / t) : 0.5,
     bordeIzq: r4(bordeIzq / n), bordeDer: r4(bordeDer / n), bordeAbajo: r4(bordeAbajo / n),
+    bordeLados: r4((bordeIzq + bordeDer) / n),
+    alturaBorde: r4(alturaBorde),
+    cxPlastico: pn > 0.01 * n ? r4(px / pn) : 0.5,
     asimetria: r4(asim / (n / 2) / 765),
     oscArriba: r4(oscArriba / nArr), oscEsquinas: r4(oscEsq / nEsq),
+    lumCentro: nC ? r4(lumC / nC) : 0,
+    texturaCentro: nC ? r4(Math.sqrt(texC / nC)) : 0,
   };
 }
